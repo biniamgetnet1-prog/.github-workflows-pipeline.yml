@@ -1,0 +1,174 @@
+import os
+import sqlite3
+import smtplib
+from datetime import datetime
+from email.message import EmailMessage
+
+import pandas as pd
+import great_expectations as gx
+from prefect import flow, task
+
+# ==============================================================================
+# NOTIFICATION HELPER
+# ==============================================================================
+def send_email_notification(subject: str, body: str):
+    """Sends email notifications using environment variables."""
+    sender_email = os.getenv("SENDER_EMAIL")
+    receiver_email = os.getenv("RECEIVER_EMAIL")
+    email_password = os.getenv("EMAIL_PASSWORD")
+
+    if not all([sender_email, receiver_email, email_password]):
+        print("[Notification] Email credentials missing. Skipping notification.")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender_email
+    msg["To"] = receiver_email
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender_email, email_password)
+            server.send_message(msg)
+        print("[Notification] Email sent successfully.")
+    except Exception as e:
+        print(f"[Notification] Failed to send email: {e}")
+
+
+# ==============================================================================
+# PREFECT TASKS
+# ==============================================================================
+@task(retries=2, retry_delay_seconds=10)
+def ingest_data() -> str:
+    """Task 1: Downloads the raw IBM Telco Churn CSV data."""
+    url = "https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp-for-data/master/data/WA_Fn-UseC_-Telco-Customer-Churn.csv"
+    df = pd.read_csv(url)
+    raw_path = "/tmp/raw_telco_churn.csv"
+    df.to_csv(raw_path, index=False)
+    print(f"[Ingest Data] Downloaded {len(df)} records.")
+    return raw_path
+
+
+@task
+def store_raw_data(raw_csv_path: str) -> dict:
+    """Task 2: Stores raw data into SQLite and Parquet."""
+    df = pd.read_csv(raw_csv_path)
+
+    db_path = "/tmp/telco_churn.db"
+    conn = sqlite3.connect(db_path)
+    df.to_sql("raw_telco_churn", conn, index=False, if_exists="replace")
+    conn.close()
+
+    parquet_path = "/tmp/raw_telco_churn.parquet"
+    df.to_parquet(parquet_path, index=False)
+    return {"sqlite_path": db_path, "parquet_path": parquet_path}
+
+
+@task
+def clean_and_preprocess(paths: dict) -> str:
+    """Task 3: Handles missing values and converts data types."""
+    conn = sqlite3.connect(paths["sqlite_path"])
+    df = pd.read_sql_query("SELECT * FROM raw_telco_churn", conn)
+    conn.close()
+
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"].str.strip(), errors="coerce").fillna(0.0)
+
+    binary_cols = ["Partner", "Dependents", "PhoneService", "PaperlessBilling", "Churn"]
+    for col in binary_cols:
+        df[col] = df[col].map({"Yes": 1, "No": 0}).fillna(0).astype(int)
+
+    cleaned_path = "/tmp/cleaned_telco_churn.csv"
+    df.to_csv(cleaned_path, index=False)
+    return cleaned_path
+
+
+@task
+def feature_engineering(cleaned_csv_path: str) -> str:
+    """Task 4: Generates 10+ domain-relevant features."""
+    df = pd.read_csv(cleaned_csv_path)
+
+    df["is_senior"] = df["SeniorCitizen"].astype(int)
+    df["is_month_to_month"] = (df["Contract"] == "Month-to-month").astype(int)
+    df["is_one_year"] = (df["Contract"] == "One year").astype(int)
+    df["is_two_year"] = (df["Contract"] == "Two year").astype(int)
+    df["is_electronic_check"] = (df["PaymentMethod"] == "Electronic check").astype(int)
+    df["has_internet"] = (df["InternetService"] != "No").astype(int)
+    df["has_fiber_optic"] = (df["InternetService"] == "Fiber optic").astype(int)
+    df["has_online_security"] = (df["OnlineSecurity"] == "Yes").astype(int)
+    df["has_tech_support"] = (df["TechSupport"] == "Yes").astype(int)
+    df["avg_monthly_charge"] = (df["TotalCharges"] / (df["tenure"] + 1)).round(2)
+    df["tenure_years"] = (df["tenure"] / 12).round(2)
+
+    fe_path = "/tmp/feature_engineered_telco_churn.csv"
+    df.to_csv(fe_path, index=False)
+    return fe_path
+
+
+@task
+def quality_checks(fe_csv_path: str) -> str:
+    """Task 5: Validates data quality using Great Expectations."""
+    df = pd.read_csv(fe_csv_path)
+
+    context = gx.get_context()
+    data_source = context.data_sources.add_pandas(name="prefect_gx_source")
+    data_asset = data_source.add_dataframe_asset(name="telco_fe_asset")
+    batch = data_asset.add_batch_definition_entire_dataframe("full_batch").get_batch({"dataframe": df})
+
+    expectations = [
+        gx.expectations.ExpectColumnValuesToNotBeNull(column="customerID"),
+        gx.expectations.ExpectColumnValuesToBeUnique(column="customerID"),
+        gx.expectations.ExpectColumnValuesToBeBetween(column="tenure", min_value=0, max_value=120),
+        gx.expectations.ExpectColumnValuesToBeInSet(column="Churn", value_set=[0, 1]),
+    ]
+
+    for exp in expectations:
+        res = batch.validate(exp)
+        if not res.success:
+            raise ValueError(f"Quality Check Failed: {exp.__class__.__name__}")
+
+    return fe_csv_path
+
+
+@task
+def save_ml_ready_data(validated_csv_path: str) -> str:
+    """Task 6: Persists final dataset to Parquet and SQLite."""
+    df = pd.read_csv(validated_csv_path)
+
+    final_parquet = "/tmp/ml_ready_telco_churn.parquet"
+    df.to_parquet(final_parquet, index=False)
+
+    conn = sqlite3.connect("/tmp/telco_churn.db")
+    df.to_sql("ml_ready_telco_churn", conn, index=False, if_exists="replace")
+    conn.close()
+
+    return final_parquet
+
+
+# ==============================================================================
+# PREFECT FLOW (ORCHESTRATOR)
+# ==============================================================================
+@flow(name="Telco Churn Data Engineering Pipeline")
+def telco_churn_pipeline():
+    try:
+        raw_csv = ingest_data()
+        stored_paths = store_raw_data(raw_csv)
+        cleaned_csv = clean_and_preprocess(stored_paths)
+        fe_csv = feature_engineering(cleaned_csv)
+        validated_csv = quality_checks(fe_csv)
+        final_parquet = save_ml_ready_data(validated_csv)
+
+        send_email_notification(
+            subject="[SUCCESS] Telco Churn Pipeline Completed",
+            body=f"Pipeline executed successfully at {datetime.now()}.\nFinal dataset stored at: {final_parquet}",
+        )
+    except Exception as e:
+        send_email_notification(
+            subject="[FAILURE] Telco Churn Pipeline Failed",
+            body=f"Pipeline failed at {datetime.now()}.\nError details:\n{str(e)}",
+        )
+        raise e
+
+
+if __name__ == "__main__":
+    telco_churn_pipeline()
